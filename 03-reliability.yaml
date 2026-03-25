@@ -1,0 +1,183 @@
+# ==============================================================================
+# RELIABILITY POLICIES — Kyverno v1.17
+# API: policies.kyverno.io/v1 | Kind: ValidatingPolicy
+#
+# Ensures every workload has the resource guardrails, health probes, and label
+# metadata needed to operate predictably and be operated efficiently.
+# ==============================================================================
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 1: Require Resource Requests and Limits
+# Containers without requests are scheduled on any node regardless of actual
+# capacity. Without limits, a single container can starve all others on the node.
+# Both fields are required for Guaranteed QoS and predictable scheduling.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-resource-requests-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Requests and Limits
+    policies.kyverno.io/category: Reliability
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Missing resource requests cause unpredictable scheduling. Missing limits
+      allow noisy-neighbour CPU/memory exhaustion. Both are required for
+      Guaranteed QoS class.
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  validations:
+    - expression: >-
+        object.spec.containers.all(c,
+          has(c.resources) &&
+          has(c.resources.requests) &&
+          has(c.resources.requests.cpu) &&
+          has(c.resources.requests.memory)
+        )
+      message: >-
+        All containers must specify resources.requests.cpu and
+        resources.requests.memory.
+    - expression: >-
+        object.spec.containers.all(c,
+          has(c.resources) &&
+          has(c.resources.limits) &&
+          has(c.resources.limits.memory)
+        )
+      message: >-
+        All containers must specify resources.limits.memory to prevent OOM
+        and noisy-neighbour memory exhaustion. (CPU limits are not required).
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        object.spec.initContainers.all(c,
+          has(c.resources) &&
+          has(c.resources.requests) &&
+          has(c.resources.requests.cpu) &&
+          has(c.resources.requests.memory) &&
+          has(c.resources.limits) &&
+          has(c.resources.limits.memory)
+        )
+      message: "initContainers must also define resource requests and memory limits."
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 2: Require Required Labels
+# Labels are the primary mechanism for operating workloads: filtering logs,
+# routing alerts, attributing costs, and selecting pods in Services. Missing
+# labels make the cluster unoperatable at scale.
+# Required: app (pod selector), team (ownership), env (environment tier)
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-required-labels
+  annotations:
+    policies.kyverno.io/title: Require Required Labels
+    policies.kyverno.io/category: Reliability
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      app, team, and env labels are required on all Deployments for cost
+      attribution, alert routing, log filtering, and operational ownership.
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        has(object.metadata.labels.app)
+      messageExpression: >-
+        "Deployment '" + object.metadata.name +
+        "' is missing required label 'app'."
+    - expression: >-
+        has(object.metadata.labels) &&
+        has(object.metadata.labels.team)
+      messageExpression: >-
+        "Deployment '" + object.metadata.name +
+        "' is missing required label 'team'. Set to the owning team name."
+    - expression: >-
+        has(object.metadata.labels) &&
+        has(object.metadata.labels.env)
+      messageExpression: >-
+        "Deployment '" + object.metadata.name +
+        "' is missing required label 'env'. Valid values: dev, stg, prod."
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 4: Disallow hostPath Volumes
+# hostPath mounts give container processes direct access to the host filesystem.
+# This bypasses namespace isolation, enables privilege escalation, and is a
+# common container escape vector. Use PersistentVolumeClaims instead.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: disallow-host-path
+  annotations:
+    policies.kyverno.io/title: Disallow hostPath Volumes
+    policies.kyverno.io/category: Reliability
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      hostPath volumes expose the host filesystem to containers, enabling
+      container escapes and privilege escalation. Use PVCs instead.
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.hostPath))
+      message: >-
+        hostPath volumes are not allowed. Use PersistentVolumeClaims (PVC)
+        for persistent storage needs.

@@ -1,0 +1,505 @@
+# ==============================================================================
+# MUTATE POLICIES — Kyverno v1.17
+# API: policies.kyverno.io/v1 | Kind: MutatingPolicy
+#
+# Automatically patch resources at admission time to inject defaults.
+# This reduces boilerplate, enforces consistency, and ensures every workload
+# has sensible baseline values even when developers forget to set them.
+#
+# MutatingPolicy uses CEL with ApplyConfiguration (Object{}) or JSONPatch{}.
+# Mutations run BEFORE ValidatingPolicy checks, so mutated values satisfy
+# validation rules automatically.
+# ==============================================================================
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 1: Add Standard Labels
+# Injects team, env, and managed-by labels onto Pods and Deployments that do
+# not already have them. Ensures every workload is attributable and filterable
+# without requiring developers to remember to add boilerplate metadata.
+#
+# Logic: only injects labels that are missing — does not overwrite existing ones.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-add-standard-labels
+  annotations:
+    policies.kyverno.io/title: Add Standard Labels
+    policies.kyverno.io/category: Mutate
+    policies.kyverno.io/description: >-
+      Automatically injects managed-by: kyverno label onto Pods and Deployments
+      that do not already have it. Provides baseline operational metadata even
+      when developers omit it.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["", "apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods", "deployments"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    # Inject managed-by label if missing
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          !(has(object.metadata.labels) && has(object.metadata.labels["managed-by"])) ?
+          Object{
+            metadata: Object.metadata{
+              labels: Object.metadata.labels{
+                "managed-by": "kyverno"
+              }
+            }
+          } : Object{}
+    # Inject env: unknown if there is no env label (sentinel for governance audit)
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          !(has(object.metadata.labels) && has(object.metadata.labels.env)) ?
+          Object{
+            metadata: Object.metadata{
+              labels: Object.metadata.labels{
+                env: "unknown"
+              }
+            }
+          } : Object{}
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 2: Add Default Resource Limits
+# Containers submitted without resource limits will have sensible defaults
+# injected automatically. This prevents BestEffort QoS and potential
+# noisy-neighbour OOMKill events while teams migrate to explicit limits.
+#
+# Defaults:   CPU request: 100m
+#             Memory request: 128Mi | Memory limit: 512Mi
+#
+# If a container already has limits set, this mutation does NOT overwrite them.
+# Promote this policy to set tighter defaults once teams begin specifying their own.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-add-default-resource-limits
+  annotations:
+    policies.kyverno.io/title: Add Default Resource Limits
+    policies.kyverno.io/category: Mutate
+    policies.kyverno.io/description: >-
+      Injects default CPU/memory requests and limits for containers missing them.
+      Prevents BestEffort QoS and noisy-neighbour resource exhaustion as a
+      safety net during migration to explicit resource definitions.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    # Inject default resource requests/limits per container — triggers when
+    # EITHER requests or limits are missing (fixes alignment with validation
+    # that requires both requests AND limits with cpu AND memory).
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              containers: object.spec.containers.map(c,
+                !(has(c.resources) && has(c.resources.requests) && has(c.resources.requests.cpu) && has(c.resources.requests.memory) && has(c.resources.limits) && has(c.resources.limits.memory)) ?
+                Object.spec.containers{
+                  name: c.name,
+                  resources: Object.spec.containers.resources{
+                    requests: Object.spec.containers.resources.requests{
+                      cpu: "100m",
+                      memory: "128Mi"
+                    },
+                    limits: Object.spec.containers.resources.limits{
+                      memory: "512Mi"
+                    }
+                  }
+                } :
+                Object.spec.containers{
+                  name: c.name
+                }
+              )
+            }
+          }
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 4: Auto-inject securityContext — allowPrivilegeEscalation: false
+# Automatically sets allowPrivilegeEscalation: false on every container that
+# does not already define it. Works in tandem with the ValidatingPolicy in
+# 01-security.yaml: the mutation runs first so the validation always passes.
+# Containers that already have the field set explicitly are left untouched.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-set-allow-privilege-escalation-false
+  annotations:
+    policies.kyverno.io/title: Auto-inject allowPrivilegeEscalation false
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Always sets securityContext.allowPrivilegeEscalation: false on containers
+      that either don't have the field OR have it explicitly set to true.
+      Developers are never blocked — the policy silently corrects the value.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              containers: object.spec.containers.map(c,
+                !has(c.securityContext) || !has(c.securityContext.allowPrivilegeEscalation) || c.securityContext.allowPrivilegeEscalation == true ?
+                Object.spec.containers{
+                  name: c.name,
+                  securityContext: Object.spec.containers.securityContext{
+                    allowPrivilegeEscalation: false
+                  }
+                } :
+                Object.spec.containers{ name: c.name }
+              )
+            }
+          }
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 4a: Auto-inject securityContext — privileged: false
+# Always sets securityContext.privileged: false on every container that either
+# does not define the field OR has it explicitly set to true.
+# Developers are never blocked — the policy silently corrects the value.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-set-privileged-false
+  annotations:
+    policies.kyverno.io/title: Auto-inject privileged false
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Always sets securityContext.privileged: false on containers that either
+      don't have the field OR have it explicitly set to true. Developers are
+      never blocked — the policy silently corrects the value.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              containers: object.spec.containers.map(c,
+                !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged == true ?
+                Object.spec.containers{
+                  name: c.name,
+                  securityContext: Object.spec.containers.securityContext{
+                    privileged: false
+                  }
+                } :
+                Object.spec.containers{ name: c.name }
+              )
+            }
+          }
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 5: Auto-inject securityContext — readOnlyRootFilesystem: true
+# Automatically sets readOnlyRootFilesystem: true on every container that does
+# not already define it. Prevents malware persistence and binary tampering.
+# Note: apps that write to the root filesystem will need an emptyDir or PVC
+# volumeMount — this mutation surfaces that requirement early.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-set-readonly-root-filesystem
+  annotations:
+    policies.kyverno.io/title: Auto-inject readOnlyRootFilesystem true
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Always sets securityContext.readOnlyRootFilesystem: true on containers
+      that either don't have the field OR have it explicitly set to false.
+      Developers are never blocked — the policy silently corrects the value.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              containers: object.spec.containers.map(c,
+                !has(c.securityContext) || !has(c.securityContext.readOnlyRootFilesystem) || c.securityContext.readOnlyRootFilesystem == false ?
+                Object.spec.containers{
+                  name: c.name,
+                  securityContext: Object.spec.containers.securityContext{
+                    readOnlyRootFilesystem: true
+                  }
+                } :
+                Object.spec.containers{ name: c.name }
+              )
+            }
+          }
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 6: Auto-inject securityContext — capabilities.drop: ["ALL"]
+# Automatically drops all Linux capabilities on containers that have no
+# capabilities block defined. This enforces the least-privilege kernel surface
+# without requiring every developer to remember the securityContext syntax.
+# Apps that legitimately need a capability (e.g. NET_BIND_SERVICE) must
+# explicitly add it back via capabilities.add — making the need visible in code.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-drop-all-capabilities
+  annotations:
+    policies.kyverno.io/title: Auto-inject capabilities.drop ALL
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Always ensures securityContext.capabilities.drop includes ALL on containers
+      that either have no capabilities block OR have one that is missing drop:ALL.
+      A container that adds specific capabilities (e.g. NET_BIND_SERVICE) will
+      still have drop:ALL merged in, following least-privilege principle.
+      Developers are never blocked — the policy silently adds the missing drop.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              containers: object.spec.containers.map(c,
+                !has(c.securityContext) || !has(c.securityContext.capabilities) ||
+                !(has(c.securityContext.capabilities.drop) && c.securityContext.capabilities.drop.exists(cap, cap == "ALL")) ?
+                Object.spec.containers{
+                  name: c.name,
+                  securityContext: Object.spec.containers.securityContext{
+                    capabilities: Object.spec.containers.securityContext.capabilities{
+                      drop: ["ALL"]
+                    }
+                  }
+                } :
+                Object.spec.containers{ name: c.name }
+              )
+            }
+          }
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 7: Auto-inject securityContext — runAsNonRoot: true + runAsUser: 65534
+# Always sets runAsNonRoot: true at pod level.
+# Sets runAsUser: 65534 (nobody) ONLY if missing or explicitly set to 0 (root).
+# If a developer already set a non-zero runAsUser, it is left untouched.
+# Developers are never blocked — the policy silently corrects the values.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-set-run-as-non-root
+  annotations:
+    policies.kyverno.io/title: Auto-inject runAsNonRoot and runAsUser
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Always sets pod-level securityContext.runAsNonRoot: true. Sets
+      runAsUser: 65534 (nobody) when it is missing or explicitly 0. If
+      the developer set a non-zero UID, it is preserved. Developers are
+      never blocked — the policy silently corrects the values.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+  mutations:
+    # Always ensure runAsNonRoot: true (overwrite false if explicitly set)
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          !has(object.spec.securityContext) || !has(object.spec.securityContext.runAsNonRoot) || object.spec.securityContext.runAsNonRoot == false ?
+          Object{
+            spec: Object.spec{
+              securityContext: Object.spec.securityContext{
+                runAsNonRoot: true
+              }
+            }
+          } : Object{}
+    # Set runAsUser: 65534 only when missing or explicitly 0 (root)
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          !has(object.spec.securityContext) || !has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser == 0 ?
+          Object{
+            spec: Object.spec{
+              securityContext: Object.spec.securityContext{
+                runAsUser: 65534
+              }
+            }
+          } : Object{}
+
+---
+# ------------------------------------------------------------------------------
+# POLICY 8: Auto-inject Seccomp Profile RuntimeDefault
+# Without a seccomp profile containers have access to ~300+ Linux syscalls.
+# Pod Security Standard "Restricted" requires RuntimeDefault or Localhost.
+# This mutation injects RuntimeDefault when the field is absent AND also
+# overwrites an explicit Unconfined value. Developers are never blocked.
+# ------------------------------------------------------------------------------
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: mutate-set-seccomp-runtime-default
+  annotations:
+    policies.kyverno.io/title: Auto-inject Seccomp RuntimeDefault
+    policies.kyverno.io/category: Security Mutate
+    policies.kyverno.io/description: >-
+      Sets pod-level seccompProfile.type: RuntimeDefault when no seccomp
+      profile is defined OR when it is explicitly set to Unconfined.
+      Developers are never blocked — the policy silently corrects the value.
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: exclude-system-namespaces
+      expression: >-
+        !(request.namespace in [
+          "kube-system", "kube-public", "default", "kube-node-lease",
+          "kyverno", "argocd", "tanzu-package-repo-global", "tanzu-system",
+          "vmware-system-auth", "vmware-system-cloud-provider",
+          "vmware-system-csi", "vmware-system-tmc",
+          "kubernetes-dashboard", "velero", "gatekeeper-system",
+          "flux-system", "nginx-ingress", "monitoring", "calico-system",
+          "istio-operator", "istio-system", "logging", "vault",
+          "atlantis", "wiz", "kube-policy"])
+    - name: needs-seccomp-fix
+      expression: >-
+        !has(object.spec.securityContext) ||
+        !has(object.spec.securityContext.seccompProfile) ||
+        object.spec.securityContext.seccompProfile.type == "Unconfined"
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{
+            spec: Object.spec{
+              securityContext: Object.spec.securityContext{
+                seccompProfile: Object.spec.securityContext.seccompProfile{
+                  type: "RuntimeDefault"
+                }
+              }
+            }
+          }
