@@ -53,11 +53,9 @@ kubectl apply -f Kyverno/02-high-availability.yaml
 kubectl apply -f Kyverno/03-reliability.yaml
 kubectl apply -f Kyverno/04-governance.yaml
 kubectl apply -f Kyverno/05-mutate.yaml    # MutatingPolicy applies immediately
-kubectl apply -f Kyverno/06-generate.yaml  # GeneratingPolicy applies immediately
 ```
 
-Mutate and Generate policies are safe to apply immediately — they only add or
-create resources, they never block.
+Mutate policies are safe to apply immediately — they only add resources, they never block.
 
 ### Week 3-4: Fix Violations
 
