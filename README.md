@@ -18,7 +18,6 @@ the dedicated CEL-based kinds below.
 |------|-----|----------|
 | `ValidatingPolicy` | `policies.kyverno.io/v1` | ClusterPolicy validate rules |
 | `MutatingPolicy` | `policies.kyverno.io/v1` | ClusterPolicy mutate rules |
-| `GeneratingPolicy` | `policies.kyverno.io/v1` | ClusterPolicy generate rules |
 
 ### How enforcement works
 
@@ -27,8 +26,6 @@ the dedicated CEL-based kinds below.
 - `[Audit]` — records to PolicyReport, does not block
 
 **MutatingPolicy** — patches via CEL `Object{}` (ApplyConfiguration) or `JSONPatch{}`.
-
-**GeneratingPolicy** — creates downstream resources via `generator.Apply(ns, [resources])`.
 
 ---
 
@@ -42,7 +39,6 @@ Kyverno/
 ├── 03-reliability.yaml             # ValidatingPolicy — resources & labels
 ├── 04-governance.yaml              # ValidatingPolicy — namespace governance
 ├── 05-mutate.yaml                  # MutatingPolicy   — inject defaults
-├── 06-generate.yaml                # GeneratingPolicy — auto-create resources
 └── 07-enforcement-strategy.md      # Rollout guide: Audit -> Enforce
 ```
 
@@ -106,14 +102,7 @@ All remaining validators are `[Deny]` only for things that **cannot be safely au
 | 7 | `mutate-set-run-as-non-root` | always sets `runAsNonRoot:true`; sets `runAsUser:65534` only if missing/root |
 | 8 | `mutate-set-seccomp-runtime-default` | sets `RuntimeDefault` — overwrites explicit `Unconfined` |
 
-### 06-generate.yaml — Auto-Create Resources (GeneratingPolicy)
-
-| # | Name | What it creates |
-|---|------|----------------|
-| 1 | `generate-default-network-policy` | default-deny + DNS egress NetworkPolicy |
-| 2 | `generate-resource-quota-limitrange` | ResourceQuota + LimitRange |
-
-**Total: 26 policies** (8 ValidatingPolicy, 8 MutatingPolicy, 2 GeneratingPolicy, 1 strategy doc)
+**Total: 24 policies** (8 ValidatingPolicy, 8 MutatingPolicy, 1 strategy doc)
 
 ### Auto-Fix Security Context enforcement
 
